@@ -788,7 +788,7 @@ class Player(discord.VoiceProtocol):
         if not session_id or not token or not endpoint:
             return
 
-        request: RequestPayload = {"voice": {"sessionId": session_id, "token": token, "endpoint": endpoint}}
+        request: RequestPayload = {"voice": {"sessionId": session_id, "token": token, "endpoint": endpoint, "channelId": str(self.channel.id) if self.channel else None}}
 
         try:
             await self.node._update_player(self.guild.id, data=request)
