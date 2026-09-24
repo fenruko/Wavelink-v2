@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
-from . import __version__
 from .backoff import Backoff
 from .enums import NodeStatus
 from .exceptions import AuthorizationFailedException, NodeException
@@ -62,14 +61,7 @@ class Websocket:
 
     @property
     def headers(self) -> dict[str, str]:
-        assert self.node.client is not None
-        assert self.node.client.user is not None
-
-        data = {
-            "Authorization": self.node.password,
-            "User-Id": str(self.node.client.user.id),
-            "Client-Name": f"Wavelink/{__version__}",
-        }
+        data = self.node._rest_headers().copy()
 
         if self.node.session_id:
             data["Session-Id"] = self.node.session_id
@@ -190,10 +182,12 @@ class Websocket:
                 state: PlayerState = data["state"]
 
                 updatepayload: PlayerUpdateEventPayload = PlayerUpdateEventPayload(player=playerup, state=state)
-                self.dispatch("player_update", updatepayload)
+                # Stamp position on the reader turn. A follow-up task delayed the
+                # monotonic clock and allocated a Task for three integer assignments.
+                if playerup is not None:
+                    playerup._update_event(updatepayload)
 
-                if playerup:
-                    asyncio.create_task(playerup._update_event(updatepayload))
+                self.dispatch("player_update", updatepayload)
 
             elif data["op"] == "stats":
                 statspayload: StatsEventPayload = StatsEventPayload(data=data)
@@ -207,10 +201,10 @@ class Websocket:
                     track: Playable = Playable(data["track"])
 
                     startpayload: TrackStartEventPayload = TrackStartEventPayload(player=player, track=track)
-                    self.dispatch("track_start", startpayload)
+                    if player is not None:
+                        player._track_start(startpayload)
 
-                    if player:
-                        asyncio.create_task(player._track_start(startpayload))
+                    self.dispatch("track_start", startpayload)
 
                 elif data["type"] == "TrackEndEvent":
                     track: Playable = Playable(data["track"])
@@ -222,8 +216,8 @@ class Websocket:
                     endpayload: TrackEndEventPayload = TrackEndEventPayload(player=player, track=track, reason=reason)
                     self.dispatch("track_end", endpayload)
 
-                    if player:
-                        asyncio.create_task(player._auto_play_event(endpayload))
+                    if player is not None:
+                        player._spawn(player._auto_play_event(endpayload))
 
                 elif data["type"] == "TrackExceptionEvent":
                     track: Playable = Playable(data["track"])
@@ -262,8 +256,8 @@ class Websocket:
                     )
                     self.dispatch("websocket_closed", wcpayload)
 
-                    if player:
-                        asyncio.create_task(player._disconnected_wait(code, by_remote))
+                    if player is not None:
+                        player._spawn(player._disconnected_wait(code, by_remote))
 
                 else:
                     other_payload: ExtraEventPayload = ExtraEventPayload(node=self.node, player=player, data=data)

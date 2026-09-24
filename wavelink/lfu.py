@@ -24,7 +24,6 @@ SOFTWARE.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,7 +67,7 @@ class DLLNode:
         self.later = later
 
 
-@dataclass
+@dataclass(slots=True)
 class DataNode:
     key: Any
     value: Any
@@ -81,7 +80,9 @@ class LFUCache:
         self._capacity = capacity
         self._cache: dict[Any, DataNode] = {}
 
-        self._freq_map: defaultdict[int, DLL] = defaultdict(DLL)
+        # Plain dict so empty frequency buckets can be dropped. A defaultdict
+        # retained every frequency a hot key ever reached.
+        self._freq_map: dict[int, DLL] = {}
         self._min: int = 1
         self._used: int = 0
 
@@ -101,16 +102,30 @@ class LFUCache:
     def capacity(self) -> int:
         return self._capacity
 
+    def _bucket(self, frequency: int) -> DLL:
+        bucket = self._freq_map.get(frequency)
+        if bucket is None:
+            bucket = DLL()
+            self._freq_map[frequency] = bucket
+        return bucket
+
     def get(self, key: Any, default: Any = MISSING) -> Any:
-        if key not in self._cache:
+        data: DataNode | None = self._cache.get(key)
+        if data is None:
             return default if default is not MISSING else NotFound
 
-        data: DataNode = self._cache[key]
-        self._freq_map[data.frequency].remove(data.node)
-        self._freq_map[data.frequency + 1].append(data.node)
+        freq = data.frequency
+        bucket = self._freq_map[freq]
+        bucket.remove(data.node)
+        if not bucket:
+            del self._freq_map[freq]
 
-        self._cache[key] = DataNode(key=key, value=data.value, frequency=data.frequency + 1, node=data.node)
-        self._min += self._min == data.frequency and not self._freq_map[data.frequency]
+        # Reuse the node. The previous implementation allocated a DataNode on every hit.
+        data.frequency = freq + 1
+        self._bucket(freq + 1).append(data.node)
+
+        if self._min == freq and freq not in self._freq_map:
+            self._min = freq + 1
 
         return data.value
 
@@ -118,21 +133,26 @@ class LFUCache:
         if self._capacity <= 0:
             raise CapacityZero("Unable to place item in LFU as capacity has been set to 0 or below.")
 
-        if key in self._cache:
-            self._cache[key].value = value
+        existing = self._cache.get(key)
+        if existing is not None:
+            existing.value = value
             self.get(key)
             return
 
         if self._used == self._capacity:
-            least_freq: DLL = self._freq_map[self._min]
-            least_freq_key: DLLNode | None = least_freq.popleft()
+            least_freq = self._freq_map.get(self._min)
+            evicted = least_freq.popleft() if least_freq is not None else None
 
-            if least_freq_key:
-                self._cache.pop(least_freq_key.value)
+            if evicted is not None:
+                self._cache.pop(evicted.value, None)
                 self._used -= 1
 
-        data: DataNode = DataNode(key=key, value=value, frequency=1, node=DLLNode(key))
-        self._freq_map[data.frequency].append(data.node)
+            if least_freq is not None and not least_freq:
+                del self._freq_map[self._min]
+
+        node = DLLNode(key)
+        data = DataNode(key=key, value=value, frequency=1, node=node)
+        self._bucket(1).append(node)
         self._cache[key] = data
 
         self._used += 1
@@ -162,8 +182,10 @@ class DLL:
 
     def popleft(self) -> DLLNode | None:
         node: DLLNode | None = self.head.later
-        if node is None:
-            return
+        # An empty list points head.later at the tail sentinel. Removing that
+        # sentinel used to break the list and evict a nonsense key.
+        if node is None or node is self.tail:
+            return None
 
         self.remove(node)
         return node
