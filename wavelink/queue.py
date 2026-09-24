@@ -25,6 +25,7 @@ SOFTWARE.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import random
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -99,7 +100,9 @@ class Queue:
     """
 
     def __init__(self, *, history: bool = True) -> None:
-        self._items: list[Playable] = []
+        # deque gives O(1) popleft/append. Queue.get() is the playback hot path;
+        # a list.pop(0) shifted every later track on each advance.
+        self._items: deque[Playable] = deque()
 
         self._history: Queue | None = Queue(history=False) if history else None
         self._mode: QueueMode = QueueMode.normal
@@ -178,6 +181,15 @@ class Queue:
     def __getitem__(self, __index: slice, /) -> list[Playable]: ...
 
     def __getitem__(self, __index: SupportsIndex | slice, /) -> Playable | list[Playable]:
+        if isinstance(__index, slice):
+            start, stop, step = __index.indices(len(self._items))
+            # Prefix slices are the common AutoPlay/display path. islice walks
+            # only as far as stop; a full materialization is reserved for reverse
+            # or stepped slices, which a deque cannot slice natively.
+            if step == 1:
+                return list(itertools.islice(self._items, start, stop))
+            return list(self._items)[__index]
+
         return self._items[__index]
 
     def __setitem__(self, __index: SupportsIndex, __value: Playable, /) -> None:
@@ -186,7 +198,31 @@ class Queue:
         self._wakeup_next()
 
     def __delitem__(self, __index: int | slice, /) -> None:
+        if isinstance(__index, slice):
+            length = len(self._items)
+            drop = set(range(*__index.indices(length)))
+            if not drop:
+                return
+            self._items = deque(item for i, item in enumerate(self._items) if i not in drop)
+            return
+
         del self._items[__index]
+
+    def _pop_at(self, index: int) -> Playable:
+        items = self._items
+        length = len(items)
+        if index < 0:
+            index += length
+
+        if index == 0:
+            return items.popleft()
+
+        if index == length - 1:
+            return items.pop()
+
+        track = items[index]
+        del items[index]
+        return track
 
     def __contains__(self, __other: Playable) -> bool:
         return __other in self._items
@@ -260,7 +296,7 @@ class Queue:
         if not self:
             raise QueueEmpty("There are no items currently in this queue.")
 
-        track: Playable = self._items.pop(0)
+        track: Playable = self._items.popleft()
         self._loaded = track
 
         return track
@@ -302,7 +338,7 @@ class Queue:
         if not self:
             raise QueueEmpty("There are no items currently in this queue.")
 
-        track: Playable = self._items.pop(index)
+        track: Playable = self._pop_at(index)
         self._loaded = track
 
         return track
@@ -436,35 +472,11 @@ class Queue:
             The number of tracks added to the queue.
         """
 
-        added: int = 0
-
+        # The lock preserves insert order against concurrent waiters. Yielding once
+        # per track held that lock across the whole playlist and scheduled a wakeup
+        # per song — extend under the lock is the same order at a fraction of the cost.
         async with self._lock:
-            if isinstance(item, Iterable):
-                if atomic:
-                    self._check_atomic(item)
-                    self._items.extend(item)
-                    self._wakeup_next()
-                    return len(item)
-
-                for track in item:
-                    try:
-                        self._check_compatibility(track)
-                    except TypeError:
-                        pass
-                    else:
-                        self._items.append(track)
-                        added += 1
-
-                    await asyncio.sleep(0)
-
-            else:
-                self._check_compatibility(item)
-                self._items.append(item)
-                added += 1
-                await asyncio.sleep(0)
-
-        self._wakeup_next()
-        return added
+            return self.put(item, atomic=atomic)
 
     def delete(self, index: int, /) -> None:
         """Method to delete an item in the queue by index.
@@ -593,7 +605,10 @@ class Queue:
         None
         """
 
-        random.shuffle(self._items)
+        # deque indexing is O(n), so shuffling in place would be quadratic.
+        items = list(self._items)
+        random.shuffle(items)
+        self._items = deque(items)
 
     def clear(self) -> None:
         """Remove all items from the queue.
@@ -684,16 +699,21 @@ class Queue:
 
         .. versionadded:: 3.2.0
         """
-        deleted_count: int = 0
+        # count <= 0 is documented as equivalent to removing a single match.
+        if count is not None and count <= 0:
+            count = 1
 
-        for track in self._items.copy():
-            if track == item:
-                self._items.remove(track)
+        deleted_count = 0
+        kept: deque[Playable] = deque()
+
+        for track in self._items:
+            if (count is None or deleted_count < count) and track == item:
                 deleted_count += 1
+                continue
 
-                if count is not None and deleted_count >= count:
-                    break
+            kept.append(track)
 
+        self._items = kept
         return deleted_count
 
     @property

@@ -166,6 +166,7 @@ class Node:
         self._spotify_enabled: bool = False
 
         self._websocket: Websocket | None = None
+        self._cached_headers: dict[str, str] | None = None
 
         if inactive_player_timeout and inactive_player_timeout < 10:
             logger.warning('Setting "inactive_player_timeout" below 10 seconds may result in unwanted side effects.')
@@ -177,13 +178,30 @@ class Node:
         self._inactive_channel_tokens = inactive_channel_tokens
 
     def __repr__(self) -> str:
-        return f"Node(identifier={self.identifier}, uri={self.uri}, status={self.status}, players={len(self.players)})"
+        return f"Node(identifier={self.identifier}, uri={self.uri}, status={self.status}, players={len(self._players)})"
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Node):
             return NotImplemented
 
         return other.identifier == self.identifier
+
+    def _rest_headers(self) -> dict[str, str]:
+        """Cached REST headers. aiohttp copies these into its own multidict."""
+        cached = self._cached_headers
+        if cached is not None:
+            return cached
+
+        assert self.client is not None
+        assert self.client.user is not None
+
+        cached = {
+            "Authorization": self._password,
+            "User-Id": str(self.client.user.id),
+            "Client-Name": f"Wavelink/{__version__}",
+        }
+        self._cached_headers = cached
+        return cached
 
     @property
     def headers(self) -> dict[str, str]:
@@ -193,16 +211,7 @@ class Node:
 
             This includes your Node password. Please be vigilant when using this property.
         """
-        assert self.client is not None
-        assert self.client.user is not None
-
-        data = {
-            "Authorization": self.password,
-            "User-Id": str(self.client.user.id),
-            "Client-Name": f"Wavelink/{__version__}",
-        }
-
-        return data
+        return self._rest_headers().copy()
 
     @property
     def identifier(self) -> str:
@@ -302,7 +311,7 @@ class Node:
         """
         disconnected: list[Player] = []
 
-        for player in self._players.copy().values():
+        for player in list(self._players.values()):
             try:
                 await player.disconnect()
             except Exception as e:
@@ -334,6 +343,7 @@ class Node:
             raise InvalidClientException(f"Unable to connect {self!r} as you have not provided a valid discord.Client.")
 
         self._client = client_
+        self._cached_headers = None
 
         self._has_closed = False
         if not self._session or self._session.closed:
@@ -386,14 +396,16 @@ class Node:
 
         .. versionadded:: 3.0.0
         """
-        clean_path: str = path.removesuffix("/")
+        # Strip a trailing slash from the path only. The query string can be a
+        # pre-encoded identifier that legitimately ends in "/".
+        path_only, sep, query = path.partition("?")
+        clean_path: str = path_only.removesuffix("/")
         uri: str = f"{self.uri}/{clean_path}"
-
-        if params is None:
-            params = {}
+        if sep:
+            uri = f"{uri}?{query}"
 
         async with self._session.request(
-            method=method, url=uri, params=params, json=data, headers=self.headers
+            method=method, url=uri, params=params, json=data, headers=self._rest_headers()
         ) as resp:
             if resp.status == 204:
                 return
@@ -422,21 +434,8 @@ class Node:
             return body
 
     async def _fetch_players(self) -> list[PlayerResponse]:
-        uri: str = f"{self.uri}/v4/sessions/{self.session_id}/players"
-
-        async with self._session.get(url=uri, headers=self.headers) as resp:
-            if resp.status == 200:
-                resp_data: list[PlayerResponse] = await resp.json()
-                return resp_data
-
-            else:
-                try:
-                    exc_data: ErrorResponse = await resp.json()
-                except Exception as e:
-                    logger.warning("An error occured making a request on %r: %s", self, e)
-                    raise NodeException(status=resp.status)
-
-                raise LavalinkException(data=exc_data)
+        data: list[PlayerResponse] | None = await self.send("GET", path=f"v4/sessions/{self.session_id}/players")
+        return data or []
 
     async def fetch_players(self) -> list[PlayerResponsePayload]:
         """Method to fetch the player information Lavalink holds for every connected player on this node.
@@ -469,21 +468,7 @@ class Node:
         return payload
 
     async def _fetch_player(self, guild_id: int, /) -> PlayerResponse:
-        uri: str = f"{self.uri}/v4/sessions/{self.session_id}/players/{guild_id}"
-
-        async with self._session.get(url=uri, headers=self.headers) as resp:
-            if resp.status == 200:
-                resp_data: PlayerResponse = await resp.json()
-                return resp_data
-
-            else:
-                try:
-                    exc_data: ErrorResponse = await resp.json()
-                except Exception as e:
-                    logger.warning("An error occured making a request on %r: %s", self, e)
-                    raise NodeException(status=resp.status)
-
-                raise LavalinkException(data=exc_data)
+        return await self.send("GET", path=f"v4/sessions/{self.session_id}/players/{guild_id}")
 
     async def fetch_player_info(self, guild_id: int, /) -> PlayerResponsePayload | None:
         """Method to fetch the player information Lavalink holds for the specific guild.
@@ -528,93 +513,29 @@ class Node:
         return payload
 
     async def _update_player(self, guild_id: int, /, *, data: Request, replace: bool = False) -> PlayerResponse:
-        no_replace: bool = not replace
-
-        uri: str = f"{self.uri}/v4/sessions/{self.session_id}/players/{guild_id}?noReplace={no_replace}"
-
-        async with self._session.patch(url=uri, json=data, headers=self.headers) as resp:
-            if resp.status == 200:
-                resp_data: PlayerResponse = await resp.json()
-                return resp_data
-
-            else:
-                try:
-                    exc_data: ErrorResponse = await resp.json()
-                except Exception as e:
-                    logger.warning("An error occured making a request on %r: %s", self, e)
-                    raise NodeException(status=resp.status)
-
-                raise LavalinkException(data=exc_data)
+        # str(bool) keeps the historical "True"/"False" query values Lavalink accepts.
+        return await self.send(
+            "PATCH",
+            path=f"v4/sessions/{self.session_id}/players/{guild_id}",
+            data=data,
+            params={"noReplace": str(not replace)},
+        )
 
     async def _destroy_player(self, guild_id: int, /) -> None:
-        uri: str = f"{self.uri}/v4/sessions/{self.session_id}/players/{guild_id}"
-
-        async with self._session.delete(url=uri, headers=self.headers) as resp:
-            if resp.status == 204:
-                return
-
-            try:
-                exc_data: ErrorResponse = await resp.json()
-            except Exception as e:
-                logger.warning("An error occured making a request on %r: %s", self, e)
-                raise NodeException(status=resp.status)
-
-            raise LavalinkException(data=exc_data)
+        await self.send("DELETE", path=f"v4/sessions/{self.session_id}/players/{guild_id}")
 
     async def _update_session(self, *, data: UpdateSessionRequest) -> UpdateResponse:
-        uri: str = f"{self.uri}/v4/sessions/{self.session_id}"
-
-        async with self._session.patch(url=uri, json=data, headers=self.headers) as resp:
-            if resp.status == 200:
-                resp_data: UpdateResponse = await resp.json()
-                return resp_data
-
-            else:
-                try:
-                    exc_data: ErrorResponse = await resp.json()
-                except Exception as e:
-                    logger.warning("An error occured making a request on %r: %s", self, e)
-                    raise NodeException(status=resp.status)
-
-                raise LavalinkException(data=exc_data)
+        return await self.send("PATCH", path=f"v4/sessions/{self.session_id}", data=data)
 
     async def _fetch_tracks(self, query: str) -> LoadedResponse:
-        uri: str = f"{self.uri}/v4/loadtracks?identifier={query}"
-
-        async with self._session.get(url=uri, headers=self.headers) as resp:
-            if resp.status == 200:
-                resp_data: LoadedResponse = await resp.json()
-                return resp_data
-
-            else:
-                try:
-                    exc_data: ErrorResponse = await resp.json()
-                except Exception as e:
-                    logger.warning("An error occured making a request on %r: %s", self, e)
-                    raise NodeException(status=resp.status)
-
-                raise LavalinkException(data=exc_data)
+        return await self.send("GET", path=f"v4/loadtracks?identifier={query}")
 
     async def _decode_track(self) -> TrackPayload: ...
 
     async def _decode_tracks(self) -> list[TrackPayload]: ...
 
     async def _fetch_info(self) -> InfoResponse:
-        uri: str = f"{self.uri}/v4/info"
-
-        async with self._session.get(url=uri, headers=self.headers) as resp:
-            if resp.status == 200:
-                resp_data: InfoResponse = await resp.json()
-                return resp_data
-
-            else:
-                try:
-                    exc_data: ErrorResponse = await resp.json()
-                except Exception as e:
-                    logger.warning("An error occured making a request on %r: %s", self, e)
-                    raise NodeException(status=resp.status)
-
-                raise LavalinkException(data=exc_data)
+        return await self.send("GET", path="v4/info")
 
     async def fetch_info(self) -> InfoResponsePayload:
         """Method to fetch this Lavalink Nodes info response data.
@@ -641,21 +562,7 @@ class Node:
         return payload
 
     async def _fetch_stats(self) -> StatsResponse:
-        uri: str = f"{self.uri}/v4/stats"
-
-        async with self._session.get(url=uri, headers=self.headers) as resp:
-            if resp.status == 200:
-                resp_data: StatsResponse = await resp.json()
-                return resp_data
-
-            else:
-                try:
-                    exc_data: ErrorResponse = await resp.json()
-                except Exception as e:
-                    logger.warning("An error occured making a request on %r: %s", self, e)
-                    raise NodeException(status=resp.status)
-
-                raise LavalinkException(data=exc_data)
+        return await self.send("GET", path="v4/stats")
 
     async def fetch_stats(self) -> StatsResponsePayload:
         """Method to fetch this Lavalink Nodes stats response data.
@@ -898,7 +805,9 @@ class Pool:
         if not nodes:
             raise InvalidNodeException("No nodes are currently assigned to the wavelink.Pool in a CONNECTED state.")
 
-        return sorted(nodes, key=lambda n: n._total_player_count or len(n.players))[0]
+        # 0 is a real player count. Only fall back to the local map when stats
+        # have not arrived, and do not copy that map just to measure it.
+        return min(nodes, key=lambda n: len(n._players) if n._total_player_count is None else n._total_player_count)
 
     @classmethod
     async def fetch_tracks(cls, query: str, /, *, node: Node | None = None) -> list[Playable] | Playlist:

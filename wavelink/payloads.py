@@ -115,6 +115,8 @@ class TrackStartEventPayload:
         inserted into the queue, with all your additional attributes assigned. Could be ``None``.
     """
 
+    __slots__ = ("original", "player", "track")
+
     def __init__(self, player: Player | None, track: Playable) -> None:
         self.player = player
         self.track = track
@@ -139,6 +141,8 @@ class TrackEndEventPayload:
         The original track associated this event. E.g. the track that was passed to :meth:`~wavelink.Player.play` or
         inserted into the queue, with all your additional attributes assigned. Could be ``None``.
     """
+
+    __slots__ = ("original", "player", "reason", "track")
 
     def __init__(self, player: Player | None, track: Playable, reason: str) -> None:
         self.player = player
@@ -226,6 +230,8 @@ class PlayerUpdateEventPayload:
     ping: int
         The ping of the node to the Discord voice server in milliseconds (-1 if not connected).
     """
+
+    __slots__ = ("connected", "ping", "player", "position", "time")
 
     def __init__(self, player: Player | None, state: PlayerState) -> None:
         self.player = cast(wavelink.Player, player)

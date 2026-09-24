@@ -24,9 +24,8 @@ SOFTWARE.
 
 from __future__ import annotations
 
+import urllib.parse
 from typing import TYPE_CHECKING, Any, TypeAlias, overload
-
-import yarl
 
 import wavelink
 
@@ -56,6 +55,15 @@ _source_mapping: dict[TrackSource | str | None, str] = {
 }
 
 
+def _is_url(query: str) -> bool:
+    """Whether *query* has a URL host.
+
+    ``yarl.URL(query).host`` was built on every search. ``urlsplit`` answers the
+    same question (a host is present) without constructing a URL object.
+    """
+    return bool(urllib.parse.urlsplit(query).netloc)
+
+
 Search: TypeAlias = "list[Playable] | Playlist"
 
 
@@ -69,6 +77,8 @@ class Album:
     url: str | None
         The album url. Could be ``None``.
     """
+
+    __slots__ = ("name", "url")
 
     def __init__(self, *, data: dict[Any, Any]) -> None:
         self.name: str | None = data.get("albumName")
@@ -85,6 +95,8 @@ class Artist:
     artwork: str | None
         The artist artwork url. Could be ``None``.
     """
+
+    __slots__ = ("artwork", "url")
 
     def __init__(self, *, data: dict[Any, Any]) -> None:
         self.url: str | None = data.get("artistUrl")
@@ -113,6 +125,31 @@ class Playable:
             Whether this track is equal to another. Checks both the track encoding and identifier.
     """
 
+    __slots__ = (
+        "__dict__",
+        "__weakref__",
+        "_album",
+        "_artist",
+        "_artwork",
+        "_author",
+        "_encoded",
+        "_extras",
+        "_identifier",
+        "_is_preview",
+        "_is_seekable",
+        "_is_stream",
+        "_isrc",
+        "_length",
+        "_playlist",
+        "_position",
+        "_preview_url",
+        "_raw_data",
+        "_recommended",
+        "_source",
+        "_title",
+        "_uri",
+    )
+
     def __init__(self, data: TrackPayload, *, playlist: PlaylistInfo | None = None) -> None:
         info: TrackInfoPayload = data["info"]
 
@@ -129,19 +166,34 @@ class Playable:
         self._isrc: str | None = info.get("isrc")
         self._source: str = info["sourceName"]
 
-        plugin: dict[Any, Any] = data["pluginInfo"]
-        self._album: Album = Album(data=plugin)
-        self._artist: Artist = Artist(data=plugin)
-
+        # Album, artist and extras are created on first access. A playlist of
+        # hundreds of tracks otherwise allocates three objects per song up front,
+        # most of which are never read. __dict__ stays available for track_extras().
+        plugin: dict[Any, Any] = data.get("pluginInfo") or {}
+        self._album: Album | None = None
+        self._artist: Artist | None = None
         self._preview_url: str | None = plugin.get("previewUrl")
         self._is_preview: bool | None = plugin.get("isPreview")
 
         self._playlist = playlist
         self._recommended: bool = False
-
-        self._extras: ExtrasNamespace = ExtrasNamespace(data.get("userData", {}))
-
+        self._extras: ExtrasNamespace | None = None
         self._raw_data = data
+
+    def _plugin_info(self) -> dict[Any, Any]:
+        return self._raw_data.get("pluginInfo") or {}
+
+    def _user_data(self) -> dict[str, Any]:
+        """JSON userData for Lavalink, without building an extras namespace when unused."""
+        extras = self._extras
+        if extras is not None:
+            return dict(extras)
+
+        data = self._raw_data.get("userData")
+        if not data:
+            return {}
+
+        return dict(data)
 
     def __hash__(self) -> int:
         return hash(self.encoded)
@@ -227,12 +279,20 @@ class Playable:
     @property
     def album(self) -> Album:
         """Property returning album data for this track."""
-        return self._album
+        album = self._album
+        if album is None:
+            album = Album(data=self._plugin_info())
+            self._album = album
+        return album
 
     @property
     def artist(self) -> Artist:
         """Property returning artist data for this track."""
-        return self._artist
+        artist = self._artist
+        if artist is None:
+            artist = Artist(data=self._plugin_info())
+            self._artist = artist
+        return artist
 
     @property
     def preview_url(self) -> str | None:
@@ -291,7 +351,11 @@ class Playable:
 
         .. versionadded:: 3.1.0
         """
-        return self._extras
+        extras = self._extras
+        if extras is None:
+            extras = ExtrasNamespace(self._raw_data.get("userData") or {})
+            self._extras = extras
+        return extras
 
     @extras.setter
     def extras(self, __value: ExtrasNamespace | dict[str, Any]) -> None:
@@ -413,9 +477,8 @@ class Playable:
             most appropriate node from the :class:`wavelink.Pool`.
         """
         prefix: TrackSource | str | None = _source_mapping.get(source, source)
-        check = yarl.URL(query)
 
-        if check.host:
+        if _is_url(query):
             tracks: Search = await wavelink.Pool.fetch_tracks(query, node=node)
             return tracks
 
@@ -525,6 +588,7 @@ class Playlist:
         self.url: str | None = plugin.get("url")
         self.artwork: str | None = plugin.get("artworkUrl")
         self.author: str | None = plugin.get("author")
+        self._extras: ExtrasNamespace | None = None
 
     def __str__(self) -> str:
         return self.name
@@ -626,7 +690,11 @@ class Playlist:
 
         .. versionadded:: 3.2.0
         """
-        return self._extras
+        extras = self._extras
+        if extras is None:
+            extras = ExtrasNamespace()
+            self._extras = extras
+        return extras
 
     @extras.setter
     def extras(self, __value: ExtrasNamespace | dict[str, Any]) -> None:

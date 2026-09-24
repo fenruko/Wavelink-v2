@@ -28,9 +28,9 @@ import asyncio
 import logging
 import random
 import time
-from typing import TYPE_CHECKING, Any, TypeAlias
+from collections import deque
+from typing import TYPE_CHECKING, Any
 
-import async_timeout
 import discord
 from discord.abc import Connectable
 from discord.utils import MISSING
@@ -58,8 +58,6 @@ from .tracks import Playable, Playlist
 
 
 if TYPE_CHECKING:
-    from collections import deque
-
     from discord.abc import Connectable
     from discord.types.voice import (
         GuildVoiceState as GuildVoiceStatePayload,
@@ -81,7 +79,9 @@ if TYPE_CHECKING:
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-T_a: TypeAlias = list[Playable] | Playlist
+# AutoPlay only reads the tail of auto_queue.history. Cap it so a 24/7 player
+# does not retain every recommended track it has ever played.
+_AUTO_HISTORY_LIMIT = 512
 
 
 class Player(discord.VoiceProtocol):
@@ -127,7 +127,7 @@ class Player(discord.VoiceProtocol):
         if not nodes:
             self._node = Pool.get_node()
         else:
-            self._node = sorted(nodes, key=lambda n: len(n.players))[0]
+            self._node = min(nodes, key=lambda n: len(n._players))
 
         if self.client is MISSING and self.node.client:
             self.client = self.node.client
@@ -155,9 +155,14 @@ class Player(discord.VoiceProtocol):
         self._history_count: int | None = None
 
         self._autoplay: AutoPlayMode = AutoPlayMode.disabled
-        self.__previous_seeds: asyncio.Queue[str] = asyncio.Queue(maxsize=self._previous_seeds_cutoff)
+        # Bounded ring of recent recommendation seeds. asyncio.Queue was a
+        # synchronization primitive used only as a maxlen buffer.
+        self._previous_seeds: deque[str] = deque(maxlen=self._previous_seeds_cutoff)
 
         self._auto_lock: asyncio.Lock = asyncio.Lock()
+        self._recommend_lock: asyncio.Lock = asyncio.Lock()
+        self._recommend_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._error_count: int = 0
 
         self._inactive_channel_limit: int | None = self._node._inactive_channel_tokens
@@ -165,8 +170,9 @@ class Player(discord.VoiceProtocol):
 
         self._filters: Filters = Filters()
 
-        # Needed for the inactivity checks...
-        self._inactivity_task: asyncio.Task[bool] | None = None
+        # call_later handle. A Task + sleep per track-end was a coroutine and a
+        # done-callback for what is just a timer.
+        self._inactivity_handle: asyncio.TimerHandle | None = None
         self._inactivity_wait: int | None = self._node._inactive_player_timeout
 
         self._should_wait: int = 10
@@ -185,68 +191,47 @@ class Player(discord.VoiceProtocol):
 
         await self._destroy()
 
-    def _inactivity_task_callback(self, task: asyncio.Task[bool]) -> None:
-        cancelled: bool = False
+    def _spawn(self, coro: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
-        try:
-            result: bool = task.result()
-        except asyncio.CancelledError:
-            cancelled = True
-            result = False
+    def _on_inactive(self) -> None:
+        self._inactivity_handle = None
 
-        if cancelled or result is False:
-            logger.debug("Disregarding Inactivity Check Task <%s> as it was previously cancelled.", task.get_name())
-            return
-
-        if result is not True:
-            logger.debug("Disregarding Inactivity Check Task <%s> as it received an unknown result.", task.get_name())
-            return
-
-        if not self._guild:
-            logger.debug("Disregarding Inactivity Check Task <%s> as it has no guild.", task.get_name())
-            return
-
-        if self.playing:
-            logger.debug(
-                "Disregarding Inactivity Check Task <%s> as Player <%s> is playing.", task.get_name(), self._guild.id
-            )
+        guild = self._guild
+        if guild is None or self.playing:
+            logger.debug("Disregarding inactivity check for player %s.", getattr(guild, "id", None))
             return
 
         self.client.dispatch("wavelink_inactive_player", self)
-        logger.debug('Dispatched "on_wavelink_inactive_player" for Player <%s>.', self._guild.id)
-
-    async def _inactivity_runner(self, wait: int) -> bool:
-        try:
-            await asyncio.sleep(wait)
-        except asyncio.CancelledError:
-            return False
-
-        return True
+        logger.debug('Dispatched "on_wavelink_inactive_player" for Player <%s>.', guild.id)
 
     def _inactivity_cancel(self) -> None:
-        if self._inactivity_task:
-            try:
-                self._inactivity_task.cancel()
-            except Exception:
-                pass
-
-        self._inactivity_task = None
+        handle = self._inactivity_handle
+        if handle is not None:
+            handle.cancel()
+            self._inactivity_handle = None
 
     def _inactivity_start(self) -> None:
-        if self._inactivity_wait is not None and self._inactivity_wait > 0:
-            self._inactivity_task = asyncio.create_task(self._inactivity_runner(self._inactivity_wait))
-            self._inactivity_task.add_done_callback(self._inactivity_task_callback)
+        wait = self._inactivity_wait
+        if not wait or wait <= 0:
+            return
 
-    async def _track_start(self, payload: TrackStartEventPayload) -> None:
+        self._inactivity_cancel()
+        self._inactivity_handle = asyncio.get_running_loop().call_later(wait, self._on_inactive)
+
+    def _track_start(self, payload: TrackStartEventPayload) -> None:
         self._inactivity_cancel()
 
     async def _auto_play_event(self, payload: TrackEndEventPayload) -> None:
         if not self.channel:
             return
 
-        members: int = len([m for m in self.channel.members if not m.bot])
+        has_listeners = any(not member.bot for member in self.channel.members)
         self._inactive_channel_count = (
-            self._inactive_channel_count - 1 if not members else self._inactive_channel_limit or 0
+            self._inactive_channel_count - 1 if not has_listeners else self._inactive_channel_limit or 0
         )
 
         if self._inactive_channel_limit and self._inactive_channel_count <= 0:
@@ -301,17 +286,222 @@ class Player(discord.VoiceProtocol):
                 await self._do_recommendation()
 
     async def _do_partial(self, *, history: bool = True) -> None:
-        # We still do the inactivity start here since if play fails and we have no more tracks...
-        # we should eventually fire the inactivity event...
-        self._inactivity_start()
+        # Arm inactivity only when nothing will actually start. A timer created
+        # before a successful play was always cancelled by track-start.
+        if self._current is not None:
+            self._inactivity_start()
+            return
 
-        if self._current is None:
-            try:
-                track: Playable = self.queue.get()
-            except QueueEmpty:
-                return
+        try:
+            track: Playable = self.queue.get()
+        except QueueEmpty:
+            self._inactivity_start()
+            return
 
+        try:
             await self.play(track, add_history=history)
+        except Exception:
+            self._inactivity_start()
+            raise
+
+    def _recent(self, queue: Queue, limit: int, *, reverse: bool) -> list[Playable]:
+        """Return up to *limit* tracks without copying the rest of the queue."""
+        items = queue._items
+        length = len(items)
+        if length == 0 or limit <= 0:
+            return []
+
+        take = limit if limit < length else length
+        if not reverse:
+            # Walk from the left once. Indexing a deque in a loop is quadratic.
+            picked: list[Playable] = []
+            for track in items:
+                picked.append(track)
+                if len(picked) == take:
+                    break
+            return picked
+
+        start = length - 1
+        return [items[i] for i in range(start, start - take, -1)]
+
+    def _push_auto_history(self, track: Playable) -> None:
+        history = self.auto_queue.history
+        if history is None:
+            return
+
+        history.put(track)
+        overflow = len(history) - _AUTO_HISTORY_LIMIT
+        if overflow > 0:
+            items = history._items
+            for _ in range(overflow):
+                items.popleft()
+
+    def _recommendation_seen(self) -> tuple[set[str], set[str]]:
+        """Identifier and encoded sets equivalent to ``track in history_window``.
+
+        ``Playable.__eq__`` is true when either encoded or identifier matches.
+        Hash lookups replace a linear scan of long encoded strings.
+        """
+        identifiers: set[str] = set()
+        encoded: set[str] = set()
+
+        windows: list[list[Playable]] = [
+            self._recent(self.auto_queue, 40, reverse=False),
+            self._recent(self.queue, 40, reverse=False),
+        ]
+        if self.queue.history is not None:
+            windows.append(self._recent(self.queue.history, 40, reverse=True))
+        if self.auto_queue.history is not None:
+            windows.append(self._recent(self.auto_queue.history, 60, reverse=True))
+
+        for window in windows:
+            for track in window:
+                identifiers.add(track.identifier)
+                encoded.add(track.encoded)
+
+        return identifiers, encoded
+
+    def _build_recommendation_queries(self, populate_track: Playable | None = None) -> tuple[str | None, str | None]:
+        assert self.queue.history is not None
+
+        weight = self._auto_weight
+        history_limit = max(5, 5 * weight)
+        upcoming_limit = max(3, int((5 * weight) / 3))
+
+        previous = self._previous_seeds
+        seeds: list[Playable] = [
+            track
+            for track in self._recent(self.queue.history, history_limit, reverse=True)
+            if track.identifier not in previous
+        ]
+        seeds.extend(
+            track
+            for track in self._recent(self.auto_queue, upcoming_limit, reverse=False)
+            if track.identifier not in previous
+        )
+        seeds.extend(
+            track
+            for track in (self._current, self._previous)
+            if track is not None and track.identifier not in previous
+        )
+
+        random.shuffle(seeds)
+        if populate_track is not None:
+            seeds.insert(0, populate_track)
+
+        spotify: list[str] = []
+        youtube: list[str] = []
+        for track in seeds:
+            source = track.source
+            if source == "spotify":
+                spotify.append(track.identifier)
+            elif source == "youtube":
+                youtube.append(track.identifier)
+
+        count = len(self.queue.history)
+        changed_by = min(3, count) if self._history_count is None else count - self._history_count
+        if changed_by > 0:
+            self._history_count = count
+
+        added = 0
+        for track in self._recent(self.queue.history, min(changed_by, 3), reverse=True):
+            if added == 2 and track.source == "spotify":
+                break
+
+            if track.source == "spotify":
+                spotify.insert(0, track.identifier)
+                added += 1
+            elif track.source == "youtube":
+                if youtube:
+                    youtube[0] = track.identifier
+                else:
+                    youtube.append(track.identifier)
+
+        spotify_query: str | None = None
+        youtube_query: str | None = None
+
+        if spotify:
+            spotify_seeds = spotify[:3]
+            spotify_query = f"sprec:seed_tracks={','.join(spotify_seeds)}&limit=10"
+            for seed in spotify_seeds:
+                self._add_to_previous_seeds(seed)
+
+        if youtube:
+            ytm_seed = youtube[0]
+            youtube_query = f"https://music.youtube.com/watch?v={ytm_seed}8&list=RD{ytm_seed}"
+            self._add_to_previous_seeds(ytm_seed)
+
+        return spotify_query, youtube_query
+
+    async def _search_recommendations(self, query: str | None) -> list[Playable]:
+        if not query:
+            return []
+
+        try:
+            search: wavelink.Search = await Pool.fetch_tracks(query, node=self._node)
+        except (LavalinkLoadException, LavalinkException):
+            return []
+
+        if not search:
+            return []
+
+        if isinstance(search, Playlist):
+            return search.tracks
+
+        return search
+
+    async def _apply_recommendations(self, queries: tuple[str | None, str | None], max_population: int) -> int:
+        assert self.guild is not None
+
+        spotify_query, youtube_query = queries
+        if spotify_query is None and youtube_query is None:
+            return 0
+
+        async with self._recommend_lock:
+            spotify_tracks, youtube_tracks = await asyncio.gather(
+                self._search_recommendations(spotify_query),
+                self._search_recommendations(youtube_query),
+            )
+
+            filtered = spotify_tracks + youtube_tracks
+            if not filtered:
+                # The caller logs and arms inactivity when nothing is left to pla     logger.info('Player "%s" could not load any songs via AutoPlay.', self.guild.id)
+                return 0
+
+            seen_ids, seen_encoded = self._recommendation_seen()
+            random.shuffle(filtered)
+
+            accepted: list[Playable] = []
+            for track in filtered:
+                if track.identifier in seen_ids or track.encoded in seen_encoded:
+                    continue
+
+                track._recommended = True
+                accepted.append(track)
+                seen_ids.add(track.identifier)
+                seen_encoded.add(track.encoded)
+                if len(accepted) >= max_population:
+                    break
+
+            added = self.auto_queue.put(accepted) if accepted else 0
+
+        logger.debug('Player "%s" added "%s" tracks to the auto_queue via AutoPlay.', self.guild.id, added)
+        return added
+
+    def _schedule_recommendation(self, queries: tuple[str | None, str | None], max_population: int) -> None:
+        current = self._recommend_task
+        if current is not None and not current.done():
+            return
+
+        self._recommend_task = self._spawn(self._recommendation_fill(queries, max_population))
+
+    async def _recommendation_fill(self, queries: tuple[str | None, str | None], max_population: int) -> None:
+        try:
+            await self._apply_recommendations(queries, max_population)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("AutoPlay refill failed for guild %s", getattr(self.guild, "id", None), exc_info=True)
 
     async def _do_recommendation(
         self,
@@ -324,123 +514,45 @@ class Player(discord.VoiceProtocol):
 
         max_population_: int = max_population if max_population else self._auto_cutoff
 
-        if len(self.auto_queue) > self._auto_cutoff + 1 and not populate_track:
-            # We still do the inactivity start here since if play fails and we have no more tracks...
-            # we should eventually fire the inactivity event...
-            self._inactivity_start()
+        # A queued recommendation should start immediately. The old path blocked
+        # the gap between songs on two Lavalink searches whenever the buffer
+        # dropped to the cutoff, even though those searches only append.
+        if populate_track is None and self.auto_queue:
+            needs_fill = len(self.auto_queue) <= self._auto_cutoff + 1
+            queries = self._build_recommendation_queries() if needs_fill else None
 
-            track: Playable = self.auto_queue.get()
-            self.auto_queue.history.put(track)
-
-            await self.play(track, add_history=False)
-            return
-
-        weighted_history: list[Playable] = self.queue.history[::-1][: max(5, 5 * self._auto_weight)]
-        weighted_upcoming: list[Playable] = self.auto_queue[: max(3, int((5 * self._auto_weight) / 3))]
-        choices: list[Playable | None] = [*weighted_history, *weighted_upcoming, self._current, self._previous]
-
-        # Filter out tracks which are None...
-        _previous: deque[str] = self.__previous_seeds._queue  # type: ignore
-        seeds: list[Playable] = [t for t in choices if t is not None and t.identifier not in _previous]
-        random.shuffle(seeds)
-
-        if populate_track:
-            seeds.insert(0, populate_track)
-
-        spotify: list[str] = [t.identifier for t in seeds if t.source == "spotify"]
-        youtube: list[str] = [t.identifier for t in seeds if t.source == "youtube"]
-
-        spotify_query: str | None = None
-        youtube_query: str | None = None
-
-        count: int = len(self.queue.history)
-        changed_by: int = min(3, count) if self._history_count is None else count - self._history_count
-
-        if changed_by > 0:
-            self._history_count = count
-
-        changed_history: list[Playable] = self.queue.history[::-1]
-
-        added: int = 0
-        for i in range(min(changed_by, 3)):
-            track: Playable = changed_history[i]
-
-            if added == 2 and track.source == "spotify":
-                break
-
-            if track.source == "spotify":
-                spotify.insert(0, track.identifier)
-                added += 1
-
-            elif track.source == "youtube":
-                youtube[0] = track.identifier
-
-        if spotify:
-            spotify_seeds: list[str] = spotify[:3]
-            spotify_query = f"sprec:seed_tracks={','.join(spotify_seeds)}&limit=10"
-
-            for s_seed in spotify_seeds:
-                self._add_to_previous_seeds(s_seed)
-
-        if youtube:
-            ytm_seed: str = youtube[0]
-            youtube_query = f"https://music.youtube.com/watch?v={ytm_seed}8&list=RD{ytm_seed}"
-            self._add_to_previous_seeds(ytm_seed)
-
-        async def _search(query: str | None) -> T_a:
-            if query is None:
-                return []
+            track = self.auto_queue.get()
+            self._push_auto_history(track)
 
             try:
-                search: wavelink.Search = await Pool.fetch_tracks(query, node=self._node)
-            except (LavalinkLoadException, LavalinkException):
-                return []
+                await self.play(track, add_history=False)
+            except Exception:
+                self._inactivity_start()
+                raise
 
-            if not search:
-                return []
+            if queries not in (None, (None, None)):
+                self._schedule_recommendation(queries, max_population_)
+            return
 
-            tracks: list[Playable] = search.tracks.copy() if isinstance(search, Playlist) else search
-            return tracks
+        queries = self._build_recommendation_queries(populate_track)
+        await self._apply_recommendations(queries, max_population_)
 
-        results: tuple[T_a, T_a] = await asyncio.gather(_search(spotify_query), _search(youtube_query))
+        if self._current is not None or populate_track is not None:
+            return
 
-        # track for result in results for track in result...
-        filtered_r: list[Playable] = [t for r in results for t in r]
-
-        if not filtered_r and not self.auto_queue:
+        try:
+            now = self.auto_queue.get()
+        except QueueEmpty:
             logger.info('Player "%s" could not load any songs via AutoPlay.', self.guild.id)
             self._inactivity_start()
             return
 
-        # Possibly adjust these thresholds?
-        history: list[Playable] = (
-            self.auto_queue[:40] + self.queue[:40] + self.queue.history[:-41:-1] + self.auto_queue.history[:-61:-1]
-        )
-
-        added: int = 0
-
-        random.shuffle(filtered_r)
-        for track in filtered_r:
-            if track in history:
-                continue
-
-            track._recommended = True
-            added += await self.auto_queue.put_wait(track)
-
-            if added >= max_population_:
-                break
-
-        logger.debug('Player "%s" added "%s" tracks to the auto_queue via AutoPlay.', self.guild.id, added)
-
-        if not self._current and not populate_track:
-            try:
-                now: Playable = self.auto_queue.get()
-                self.auto_queue.history.put(now)
-
-                await self.play(now, add_history=False)
-            except wavelink.QueueEmpty:
-                logger.info('Player "%s" could not load any songs via AutoPlay.', self.guild.id)
-                self._inactivity_start()
+        self._push_auto_history(now)
+        try:
+            await self.play(now, add_history=False)
+        except Exception:
+            self._inactivity_start()
+            raise
 
     @property
     def state(self) -> PlayerBasicState:
@@ -752,7 +864,7 @@ class Player(discord.VoiceProtocol):
         position: int = int((time.monotonic_ns() - self._last_update) / 1000000) + self._last_position
         return min(position, self.current.length)
 
-    async def _update_event(self, payload: PlayerUpdateEventPayload) -> None:
+    def _update_event(self, payload: PlayerUpdateEventPayload) -> None:
         # Convert nanoseconds into milliseconds...
         self._last_update = time.monotonic_ns()
         self._last_position = payload.position
@@ -833,8 +945,7 @@ class Player(discord.VoiceProtocol):
         await self.guild.change_voice_state(channel=self.channel, self_mute=self_mute, self_deaf=self_deaf)
 
         try:
-            async with async_timeout.timeout(timeout):
-                await self._connection_event.wait()
+            await asyncio.wait_for(self._connection_event.wait(), timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             msg = f"Unable to connect to {self.channel} as it exceeded the timeout of {timeout} seconds."
             raise ChannelTimeoutException(msg)
@@ -892,8 +1003,7 @@ class Player(discord.VoiceProtocol):
             return
 
         try:
-            async with async_timeout.timeout(timeout):
-                await self._connection_event.wait()
+            await asyncio.wait_for(self._connection_event.wait(), timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             msg = f"Unable to connect to {channel} as it exceeded the timeout of {timeout} seconds."
             raise ChannelTimeoutException(msg)
@@ -1006,7 +1116,7 @@ class Player(discord.VoiceProtocol):
             self._filters = filters
 
         request: RequestPayload = {
-            "track": {"encoded": track.encoded, "userData": dict(track.extras)},
+            "track": {"encoded": track.encoded, "userData": track._user_data()},
             "volume": vol,
             "position": start,
             "endTime": end,
@@ -1203,6 +1313,11 @@ class Player(discord.VoiceProtocol):
         self._connection_event.clear()
         self._inactivity_cancel()
 
+        task = self._recommend_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._recommend_task = None
+
         try:
             self.cleanup()
         except (AttributeError, KeyError):
@@ -1223,7 +1338,5 @@ class Player(discord.VoiceProtocol):
                 logger.debug("Disregarding. Failed to send 'destroy_player' payload to Lavalink: %s", e)
 
     def _add_to_previous_seeds(self, seed: str) -> None:
-        # Helper method to manage previous seeds.
-        if self.__previous_seeds.full():
-            self.__previous_seeds.get_nowait()
-        self.__previous_seeds.put_nowait(seed)
+        # deque(maxlen=...) drops the oldest seed when the cutoff is reached.
+        self._previous_seeds.append(seed)

@@ -948,23 +948,55 @@ class Filters:
         return self._plugin_filters
 
     def __call__(self) -> FilterPayload:
-        payload: FilterPayload = {
-            "volume": self._volume,
-            "equalizer": list(self._equalizer._payload.values()),
-            "karaoke": self._karaoke._payload,
-            "timescale": self._timescale._payload,
-            "tremolo": self._tremolo._payload,
-            "vibrato": self._vibrato._payload,
-            "rotation": self._rotation._payload,
-            "distortion": self._distortion._payload,
-            "channelMix": self._channel_mix._payload,
-            "lowPass": self._low_pass._payload,
-            "pluginFilters": self._plugin_filters._payload,
-        }
+        # Build only filters that actually change audio. The default equalizer is
+        # 15 zero-gain bands, which is truthy and was sent on every play — Lavalink
+        # then kept the equalizer DSP enabled for a no-op. Omitting it is the same
+        # sound with a lighter payload and no filter processor.
+        payload: FilterPayload = {}
 
-        for key, value in payload.copy().items():
-            if not value:
-                del payload[key]
+        volume = self._volume
+        if volume:
+            payload["volume"] = volume
+
+        equalizer = self._equalizer._payload
+        if any(band.get("gain") for band in equalizer.values()):
+            payload["equalizer"] = list(equalizer.values())
+
+        karaoke = self._karaoke._payload
+        if karaoke:
+            payload["karaoke"] = karaoke
+
+        timescale = self._timescale._payload
+        if timescale:
+            payload["timescale"] = timescale
+
+        tremolo = self._tremolo._payload
+        if tremolo:
+            payload["tremolo"] = tremolo
+
+        vibrato = self._vibrato._payload
+        if vibrato:
+            payload["vibrato"] = vibrato
+
+        rotation = self._rotation._payload
+        if rotation:
+            payload["rotation"] = rotation
+
+        distortion = self._distortion._payload
+        if distortion:
+            payload["distortion"] = distortion
+
+        channel_mix = self._channel_mix._payload
+        if channel_mix:
+            payload["channelMix"] = channel_mix
+
+        low_pass = self._low_pass._payload
+        if low_pass:
+            payload["lowPass"] = low_pass
+
+        plugin_filters = self._plugin_filters._payload
+        if plugin_filters:
+            payload["pluginFilters"] = plugin_filters
 
         return payload
 
